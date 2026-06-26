@@ -1,0 +1,76 @@
+"""OpenAI backend using structured-output parsing.
+
+Contrast with the Anthropic provider — a useful thing to understand:
+- OpenAI exposes `client.beta.chat.completions.parse(response_format=Schema)`, which is
+  the analogue of Anthropic's `messages.parse`.
+- Here we DO set `temperature=0` for deterministic extraction. Unlike Claude Opus 4.8
+  (which removed sampling params), OpenAI models still accept it. Same goal — determinism —
+  reached differently per provider. Hiding that difference behind one interface is the point.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, TypeVar
+
+from pydantic import BaseModel
+
+from structured_extractor.errors import ProviderError
+from structured_extractor.providers.base import ProviderResponse
+from structured_extractor.usage import TokenUsage
+
+if TYPE_CHECKING:
+    from openai import OpenAI
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+class OpenAIProvider:
+    """Structured extraction via the OpenAI Chat Completions parse helper."""
+
+    name = "openai"
+
+    def __init__(self, *, model: str, max_tokens: int, api_key: str | None = None) -> None:
+        from openai import OpenAI
+
+        self._client: OpenAI = OpenAI(api_key=api_key)
+        self._model = model
+        self._max_tokens = max_tokens
+
+    def extract(
+        self,
+        *,
+        text: str,
+        schema: type[SchemaT],
+        instructions: str,
+    ) -> ProviderResponse:
+        import openai
+
+        try:
+            completion = self._client.beta.chat.completions.parse(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": text},
+                ],
+                response_format=schema,
+            )
+        except openai.OpenAIError as exc:
+            raise ProviderError(f"OpenAI request failed: {exc}") from exc
+
+        message = completion.choices[0].message
+        if message.refusal:
+            raise ProviderError(f"OpenAI declined the request: {message.refusal}")
+
+        parsed = message.parsed
+        if parsed is None:
+            raise ProviderError("OpenAI returned no parseable structured output.")
+
+        usage_raw = completion.usage
+        usage = TokenUsage(
+            model=self._model,
+            input_tokens=usage_raw.prompt_tokens if usage_raw else 0,
+            output_tokens=usage_raw.completion_tokens if usage_raw else 0,
+        )
+        return ProviderResponse(data=parsed, usage=usage)
